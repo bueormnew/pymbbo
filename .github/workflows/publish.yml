@@ -1,0 +1,68 @@
+name: Auto Bump Version & Publish to PyPI
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  bump-and-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for skip keyword
+        id: check_skip
+        run: |
+          if [[ "${{ github.event.head_commit.message }}" == *"[skip ci]"* ]]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up Python
+        if: steps.check_skip.outputs.skip != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Bump Version
+        if: steps.check_skip.outputs.skip != 'true'
+        id: bump
+        run: |
+          python .github/scripts/bump_version.py
+
+      - name: Commit & Push Version Changes
+        if: steps.check_skip.outputs.skip != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml setup.py pymbbo/__init__.py
+          NEW_VER="${{ steps.bump.outputs.new_version }}"
+          git commit -m "chore(release): bump version to ${NEW_VER} [skip ci]"
+          git tag "v${NEW_VER}"
+          git push origin main --follow-tags
+
+      - name: Install Build Tools
+        if: steps.check_skip.outputs.skip != 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install build
+
+      - name: Build Package (sdist & wheel)
+        if: steps.check_skip.outputs.skip != 'true'
+        run: |
+          python -m build
+
+      - name: Publish to PyPI via Trusted Publisher (OIDC)
+        if: steps.check_skip.outputs.skip != 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
