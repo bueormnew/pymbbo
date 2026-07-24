@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pymbbo"
-version = "0.1.0"
+version = "0.1.1"
 description = "A modular, scalable AI framework for PyPI with dynamic architecture plugins and benchmarking suite."
 readme = "README.md"
 authors = [

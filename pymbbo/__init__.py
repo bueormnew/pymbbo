@@ -2,7 +2,7 @@
 PYMBBO: A Modular, Scalable AI Framework for PyPI
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 from pymbbo.config import Hyperparameters, Config
 from pymbbo.data.dataset import Dataset, load_dataset
