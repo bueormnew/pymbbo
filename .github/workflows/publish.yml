@@ -16,8 +16,8 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: main
           fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Check for skip keyword
         id: check_skip
@@ -34,18 +34,14 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Configure Git & Sync Main
-        if: steps.check_skip.outputs.skip != 'true'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout main
-          git pull origin main --rebase
-
-      - name: Bump Version
+      - name: Sync with Remote & Bump Version
         if: steps.check_skip.outputs.skip != 'true'
         id: bump
         run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git checkout -B main origin/main
           python .github/scripts/bump_version.py
 
       - name: Commit & Push Version Changes
@@ -55,7 +51,7 @@ jobs:
           NEW_VER="${{ steps.bump.outputs.new_version }}"
           git commit -m "chore(release): bump version to ${NEW_VER} [skip ci]" || echo "No changes to commit"
           git tag "v${NEW_VER}" || echo "Tag v${NEW_VER} already exists"
-          git push origin main
+          git push origin HEAD:main
           git push origin "v${NEW_VER}" || echo "Tag push skipped"
 
       - name: Install Build Tools
