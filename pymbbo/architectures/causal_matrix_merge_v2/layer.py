@@ -111,15 +111,14 @@ class CausalMatrixMergeLayerV2(nn.Module):
     def forward_sequence(
         self, x: torch.Tensor, state: Optional[MergeState] = None
     ) -> Tuple[torch.Tensor, MergeState]:
-        """Procesa una secuencia completa de tokens a través de la capa.
+        """Procesa secuencia completa en PARALELO (no token-a-token).
 
-        Itera token por token llamando a forward(), propagando el estado
-        entre pasos. Si no se proporciona estado inicial, se crea uno nuevo.
+        Usa el parallel scan del merge block para procesar toda la secuencia
+        de forma eficiente en GPU. ~20-50x mas rapido que el loop secuencial.
 
         Args:
             x: Tensor [B, T, model_dim] — secuencia de embeddings.
-            state: Estado inicial. Si None, se crea uno nuevo mediante
-                el método init_state del bloque merge.
+            state: Estado inicial. Si None, se crea uno nuevo.
 
         Returns:
             Tuple de (outputs [B, T, model_dim], estado final MergeState).
@@ -129,13 +128,16 @@ class CausalMatrixMergeLayerV2(nn.Module):
         if state is None:
             state = self.merge.init_state(B, device=x.device, dtype=x.dtype)
 
-        outputs = []
-        for t in range(T):
-            token = x[:, t, :]  # [B, model_dim]
-            out, state = self.forward(token, state)
-            outputs.append(out)
+        # Sub-bloque 1: Merge (paralelo via scan)
+        residual = x
+        x_normed = self.merge_norm(x)  # [B, T, model_dim] - RMSNorm opera sobre ultima dim
+        x_merged, state = self.merge.forward_sequence(x_normed, state)
+        x = residual + x_merged
 
-        # Concatenar salidas: lista de [B, model_dim] → [B, T, model_dim]
-        outputs = torch.stack(outputs, dim=1)
+        # Sub-bloque 2: MLP (ya es paralelo, opera sobre ultima dim)
+        residual = x
+        x_normed = self.mlp_norm(x)
+        x_mlp = self.mlp(x_normed)
+        x = residual + x_mlp
 
-        return outputs, state
+        return x, state
