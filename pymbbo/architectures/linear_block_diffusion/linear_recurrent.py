@@ -122,7 +122,7 @@ class LinearRecurrentLayer(nn.Module):
     Uses chunked-parallel stable gated recurrence — no Python per-token loop.
 
     Formula:
-      g_t = sigmoid(W_g * x_t)
+      g_t = sigmoid(W_g * x_t + b_g)
       h_t = g_t * h_{t-1} + (1 - g_t) * (W_in * x_t)
       y_t = W_out * h_t
     """
@@ -130,9 +130,11 @@ class LinearRecurrentLayer(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.chunk_size = chunk_size
-        self.w_in = nn.Linear(d_model, d_model)
-        self.w_gate = nn.Linear(d_model, d_model)
-        self.w_out = nn.Linear(d_model, d_model)
+        self.w_in = nn.Linear(d_model, d_model, bias=False)
+        # Gate has bias initialized to +2.0 so initial g_t ≈ sigmoid(2.0) = 0.88 (long context memory)
+        self.w_gate = nn.Linear(d_model, d_model, bias=True)
+        nn.init.constant_(self.w_gate.bias, 2.0)
+        self.w_out = nn.Linear(d_model, d_model, bias=False)
 
     def forward(
         self,
