@@ -239,30 +239,23 @@ class LinearBlockDiffusionArchitecture(BaseArchitecture):
         chunk_denoise_size: Optional[int] = None,
         temperature: float = 1.0,
         top_k: int = 50,
-        eos_token_id: Optional[int] = None
+        eos_token_id: Optional[int] = -1,
     ) -> torch.Tensor:
         """
-        Progressive Overlapping Block Diffusion Inference Generator.
-        
-        Args:
-            prompt_ids: Prompt token tensor of shape (batch_size, prompt_len)
-            max_new_tokens: Maximum number of tokens to generate
-            block_size: Block size override (default: self.block_size, e.g. 512)
-            overlap_ratio: Overlap ratio override (default: self.overlap_ratio, e.g. 0.5)
-            num_diffusion_steps: Diffusion passes per block override (default: self.num_diffusion_steps, e.g. 8)
-            chunk_denoise_size: Sub-chunk progressive unmask size (default: self.chunk_denoise_size, e.g. 64)
-            temperature: Sampling temperature
-            top_k: Top-k logits filtering
-            eos_token_id: Optional End-of-Sequence token ID for early stopping
-        Returns:
-            Generated sequence tensor of shape (batch_size, prompt_len + generated_length)
+        eos_token_id=-1 (default) → usa self.eos_token_id.
+        eos_token_id=None          → deshabilita EOS stopping.
+        eos_token_id=<int>         → usa ese token como EOS.
         """
         self.eval()
         B_size = block_size if block_size is not None else self.block_size
         ov_ratio = overlap_ratio if overlap_ratio is not None else self.overlap_ratio
         K_steps = num_diffusion_steps if num_diffusion_steps is not None else self.num_diffusion_steps
         chunk_size = chunk_denoise_size if chunk_denoise_size is not None else self.chunk_denoise_size
-        stop_eos = eos_token_id if eos_token_id is not None else self.eos_token_id
+        # eos_token_id=-1 sentinel → use model default; None → disabled; int → override
+        if eos_token_id == -1:
+            stop_eos = self.eos_token_id
+        else:
+            stop_eos = eos_token_id  # None disables EOS stopping; any int overrides
 
         batch_size, prompt_len = prompt_ids.shape
         device = prompt_ids.device

@@ -51,60 +51,69 @@ def _chunked_stable_scan(
     where S_t = cumsum(log g_k, k=1..t).  exp(S_t - S_j) = prod_{k=j+1}^t g_k ∈ (0,1],
     so it never overflows.  The cross-term h_0 * exp(S_t) is also safe because S_t ≤ 0.
 
-    For chunk_size = 32, the inner formula is evaluated over only 32 steps at once,
-    keeping numerical values well within float32 range at all times.
+    ⚠️ FLOAT32 FORCED INTERNALLY:
+    With chunk_size=32 and typical gate≈0.5, exp(-S) reaches exp(22) ≈ 3.6e9.
+    float32 max ≈ 3.4e38 → SAFE.  float16 max ≈ 65504 → OVERFLOW → NaN.
+    We always compute in float32 and cast output back to the caller's dtype.
 
     Args:
         gate_x:     (B, T, D) sigmoid gate values in (0, 1)
         proj_x:     (B, T, D) projected input values
         h_init:     (B, D)    initial hidden state
-        reverse:    If True, scan from right-to-left (for backward pass in bidirectional)
+        reverse:    If True, scan from right-to-left
         chunk_size: Number of steps to vectorise at once (default 32)
 
     Returns:
-        hidden_states: (B, T, D)
-        h_last:        (B, D)
+        hidden_states: (B, T, D)  — same dtype as inputs
+        h_last:        (B, D)     — same dtype as inputs
     """
+    orig_dtype = gate_x.dtype
+
+    # Always compute in float32 — see docstring for why
+    gate_x = gate_x.float()
+    proj_x = proj_x.float()
+    h      = h_init.float()
+
     B, T, D = gate_x.shape
 
     if reverse:
         gate_x = gate_x.flip(1)
         proj_x = proj_x.flip(1)
 
-    h = h_init
-    hidden_states = torch.empty_like(gate_x)
+    hidden_states = torch.empty(B, T, D, dtype=torch.float32, device=gate_x.device)
     num_chunks = (T + chunk_size - 1) // chunk_size
 
     for c in range(num_chunks):
         s = c * chunk_size
         e = min(s + chunk_size, T)
 
-        g = gate_x[:, s:e, :]          # (B, L, D),  L <= chunk_size
-        v = (1.0 - g) * proj_x[:, s:e, :]  # (B, L, D) — effective input
+        g = gate_x[:, s:e, :]               # (B, L, D)  gates ∈ (0,1)
+        v = (1.0 - g) * proj_x[:, s:e, :]  # (B, L, D)  effective input
 
-        # S_t = cumsum(log g_k, k=0..t) within the chunk, always ≤ 0
-        log_g = torch.log(g.clamp(min=1e-7))
-        S = torch.cumsum(log_g, dim=1)  # (B, L, D), range [S_min, log_g_0] ⊆ (-∞, 0]
+        # S_t = cumsum(log g_k) within chunk — always ≤ 0
+        log_g = torch.log(g.clamp(min=1e-6))
+        S     = torch.cumsum(log_g, dim=1)   # (B, L, D)
 
-        exp_S = torch.exp(S)            # (B, L, D), ∈ (0, 1]
-        exp_neg_S = torch.exp(-S)       # (B, L, D), ∈ [1, exp(-S_min)] — SAFE for small L
+        exp_S     = torch.exp(S)             # (B, L, D)  ∈ (0, 1] — safe
+        exp_neg_S = torch.exp(-S)            # (B, L, D)  ∈ [1, 3.6e9] — safe in fp32
 
-        # h_0 contribution: exp(S_t) * h_init_chunk
+        # h_0 contribution: exp(S_t) * h_running
         h_from_init = exp_S * h.unsqueeze(1)           # (B, L, D)
 
         # Input contribution: exp(S_t) * cumsum_j(v_j * exp(-S_j))
-        # Using exclusive prefix so that position t sums inputs j = 0..t
-        cum_weighted = torch.cumsum(v * exp_neg_S, dim=1)  # (B, L, D)
-        h_from_inputs = exp_S * cum_weighted                # (B, L, D)
+        cum_weighted   = torch.cumsum(v * exp_neg_S, dim=1)  # (B, L, D)
+        h_from_inputs  = exp_S * cum_weighted                 # (B, L, D)
 
-        chunk_out = h_from_init + h_from_inputs    # (B, L, D)
+        chunk_out = h_from_init + h_from_inputs   # (B, L, D)
         hidden_states[:, s:e, :] = chunk_out
-        h = chunk_out[:, -1, :]                    # carry forward
+        h = chunk_out[:, -1, :]                   # carry hidden state forward
 
     if reverse:
         hidden_states = hidden_states.flip(1)
 
-    return hidden_states, h
+    # Cast back to original dtype (fp16 if AMP was active)
+    return hidden_states.to(orig_dtype), h.to(orig_dtype)
+
 
 
 class LinearRecurrentLayer(nn.Module):
