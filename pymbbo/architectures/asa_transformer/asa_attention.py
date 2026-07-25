@@ -59,6 +59,7 @@ class AdaptiveSelectiveAttention(nn.Module):
     Supports both Block-level ASA (block_size > 1) and Token-level ASA (block_size = 1).
 
     Block-level ASA (Default block_size=16):
+        - Automatically pads any sequence length N to the nearest multiple of C.
         - Pass 1 (Router): Computes block-level importance scores I_{block_i}(block_j).
           Reduces routing sequence length from N to N / C (e.g., 1024 -> 64 blocks).
         - Selection: Selects top-A_blocks key blocks + self block per query block.
@@ -121,8 +122,18 @@ class AdaptiveSelectiveAttention(nn.Module):
         Optional[torch.Tensor],
         Optional[Tuple[torch.Tensor, torch.Tensor]],
     ]:
+        B, N_orig, _ = x.shape
+        H, D         = self.nhead, self.head_dim
+        C            = self.block_size
+
+        # Pad sequence length N to multiple of C for Block-ASA
+        if C > 1 and (N_orig % C != 0) and kv_cache is None:
+            pad_len  = (C - (N_orig % C)) % C
+            x = F.pad(x, (0, 0, 0, pad_len))
+        else:
+            pad_len = 0
+
         B, N, _ = x.shape
-        H, D    = self.nhead, self.head_dim
 
         q = self.q_proj(x).view(B, N, H, D).transpose(1, 2)
         k = self.k_proj(x).view(B, N, H, D).transpose(1, 2)
@@ -153,12 +164,13 @@ class AdaptiveSelectiveAttention(nn.Module):
                 out = F.softmax(s, dim=-1) @ v
             out = self.out_proj(out.transpose(1, 2).contiguous().view(B, N, self.d_model))
             fi  = torch.arange(N_total, device=x.device).view(1, 1, -1).expand(B, N, -1)
+            if pad_len > 0:
+                out = out[:, :N_orig, :]
             return out, fi, None, new_kv_cache
 
         aux_loss = None
-        C = self.block_size
 
-        # ── BLOCK-ASA PATH (if C > 1 and sequence divides cleanly) ──
+        # ── BLOCK-ASA PATH (Fast GPU Path) ───────────────────────────
         if C > 1 and (N % C == 0) and (N_total % C == 0):
             N_blocks       = N // C
             N_total_blocks = N_total // C
@@ -233,39 +245,26 @@ class AdaptiveSelectiveAttention(nn.Module):
 
             out = out_ctx.reshape(B, H, N, D)
             out = self.out_proj(out.transpose(1, 2).contiguous().view(B, N, self.d_model))
+            if pad_len > 0:
+                out = out[:, :N_orig, :]
             return out, selection_indices, aux_loss, new_kv_cache
 
-        # ── TOKEN-ASA FALLBACK PATH (for unaligned sequence lengths) ──
+        # ── TOKEN-ASA FALLBACK PATH ─────────────────────────────────
         if self.is_router or selection_indices is None:
             with torch.no_grad():
                 raw = (q.detach() @ k.detach().transpose(-2, -1)) * self.scale
                 cm  = torch.triu(torch.full((N, N_total), float("-inf"), device=x.device), 1)
                 imp = F.softmax(raw + cm[None, None], dim=-1).mean(1)
                 imp_m = imp.masked_fill(cm[None] == float("-inf"), -1e9)
-
                 a_cap = min(budget, N_total)
                 _, top_idx = torch.topk(imp_m, k=a_cap, dim=-1, sorted=False)
-                self_idx  = (
-                    torch.arange(N_total - N, N_total, device=x.device)
-                    .view(1, -1, 1)
-                    .expand(B, N, 1)
-                )
+                self_idx  = (torch.arange(N_total - N, N_total, device=x.device)
+                                 .view(1, -1, 1).expand(B, N, 1))
                 selection_indices = torch.cat([top_idx, self_idx], dim=-1)
-
-            if return_aux_loss:
-                cm_g  = torch.triu(torch.full((N, N_total), float("-inf"), device=x.device), 1)
-                imp_g = F.softmax((q @ k.transpose(-2, -1)) * self.scale + cm_g[None, None], dim=-1).mean(1)
-                sel_s = torch.gather(imp_g, -1, selection_indices)
-                min_s = sel_s.min(-1).values
-                valid = cm_g[None].expand(B, N, N_total) != float("-inf")
-                smask = torch.zeros((B, N, N_total), dtype=torch.bool, device=x.device)
-                smask.scatter_(-1, selection_indices, True)
-                non_s = imp_g.masked_fill(~(valid & ~smask), -1e9)
-                mns   = non_s.max(-1).values
-                mns   = torch.where(mns == -1e9, torch.zeros_like(mns), mns)
-                aux_loss = F.relu(self.margin_delta - min_s + mns).mean()
 
         k_gath, v_gath = _gather_kv_token(k, v, selection_indices)
         out = _pass2_token_attention(q, k_gath, v_gath, self.scale)
         out = self.out_proj(out.transpose(1, 2).contiguous().view(B, N, self.d_model))
+        if pad_len > 0:
+            out = out[:, :N_orig, :]
         return out, selection_indices, aux_loss, new_kv_cache
