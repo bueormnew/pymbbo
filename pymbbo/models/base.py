@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from typing import List, Union, Optional, Dict, Any, Callable
+from typing import List, Union, Optional, Dict, Any, Callable, Tuple
 from pymbbo.models.layers import Dense, Conv2D, Dropout, BatchNorm, Flatten
 
 class BaseModel(nn.Module):
