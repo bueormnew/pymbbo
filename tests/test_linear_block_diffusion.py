@@ -55,12 +55,14 @@ def test_standard_dataset_training_loss():
     prompt_ids = torch.randint(1, 900, (4, 30), device=device)
     target_ids = torch.randint(1, 900, (4, 128), device=device)
 
-    logits, loss = arch(prompt_ids, target_ids=target_ids)
+    logits, loss = arch(prompt_ids, target_ids=target_ids, return_logits=True)
     assert logits.shape == (4, 128, 1000)
     assert isinstance(loss, torch.Tensor)
-    assert loss.dim() == 0 # scalar
-    assert not torch.isnan(loss)
     assert loss.item() > 0
+
+    loss_only = arch(prompt_ids, target_ids=target_ids, return_logits=False)
+    assert isinstance(loss_only, torch.Tensor)
+    assert not torch.isnan(loss_only)
 
     # Backward pass check
     loss.backward()

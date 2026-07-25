@@ -90,6 +90,21 @@ class LinearBlockDiffusionArchitecture(BaseArchitecture):
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         self.lm_head.weight = self.token_embedding.weight
 
+        # Initialize weights with standard Transformer scaling (std=0.02)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module: nn.Module):
+        """Initializes weights using Transformer standard normal distribution (std=0.02)."""
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.padding_idx is not None:
+                with torch.no_grad():
+                    module.weight.data[module.padding_idx].zero_()
+
     def encode_prompt(self, prompt_ids: torch.Tensor) -> torch.Tensor:
         """Encodes input prompt tokens of variable length into persistent memory context."""
         batch_size, seq_len = prompt_ids.shape
@@ -106,6 +121,7 @@ class LinearBlockDiffusionArchitecture(BaseArchitecture):
         target_ids: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
         noise_injection_prob: Optional[float] = None,
+        return_logits: bool = False,
         **kwargs
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
@@ -144,23 +160,19 @@ class LinearBlockDiffusionArchitecture(BaseArchitecture):
         alpha_k = 1.0 - (t_k.float() / float(self.num_diffusion_steps)) # ratio of masked tokens
         p_noise = noise_injection_prob if noise_injection_prob is not None else self.noise_injection_prob
 
-        # Create noisy target sequence
-        target_noisy = target_ids.clone()
-        for i in range(target_batch):
-            num_to_mask = int(target_len * alpha_k[i].item())
-            if num_to_mask > 0:
-                mask_indices = torch.randperm(target_len, device=target_ids.device)[:num_to_mask]
-                target_noisy[i, mask_indices] = self.mask_token_id
+        # Fast Vectorized Masking on GPU
+        rand_probs = torch.rand((target_batch, target_len), device=target_ids.device)
+        mask_threshold = alpha_k.unsqueeze(1)
+        mask_matrix = rand_probs < mask_threshold
 
-            # Exposure Bias Mitigation: Inject random token corruption on a fraction of unmasked tokens
-            if p_noise > 0 and self.training:
-                unmasked_indices = (target_noisy[i] != self.mask_token_id).nonzero(as_tuple=True)[0]
-                if len(unmasked_indices) > 0:
-                    num_corrupt = int(len(unmasked_indices) * p_noise)
-                    if num_corrupt > 0:
-                        corrupt_subset = unmasked_indices[torch.randperm(len(unmasked_indices), device=target_ids.device)[:num_corrupt]]
-                        rand_tokens = torch.randint(1, self.vocab_size - 1, (num_corrupt,), device=target_ids.device)
-                        target_noisy[i, corrupt_subset] = rand_tokens
+        target_noisy = torch.where(mask_matrix, torch.tensor(self.mask_token_id, device=target_ids.device), target_ids)
+
+        # Exposure Bias Mitigation: Inject random token corruption on a fraction of unmasked tokens
+        if p_noise > 0 and self.training:
+            corrupt_mask = (~mask_matrix) & (torch.rand((target_batch, target_len), device=target_ids.device) < p_noise)
+            if corrupt_mask.any():
+                random_tokens = torch.randint(1, self.vocab_size - 1, (target_batch, target_len), device=target_ids.device)
+                target_noisy = torch.where(corrupt_mask, random_tokens, target_noisy)
 
         # Embed noisy target
         pos = torch.arange(target_len, device=target_ids.device).unsqueeze(0)
@@ -177,7 +189,11 @@ class LinearBlockDiffusionArchitecture(BaseArchitecture):
             ignore_index=self.pad_token_id
         )
 
-        return logits, loss
+        if return_logits:
+            return logits, loss
+        
+        # Return 1D loss tensor for fast DataParallel gathering without PCIe bandwidth bottleneck
+        return loss.unsqueeze(0)
 
     @torch.no_grad()
     def generate(
