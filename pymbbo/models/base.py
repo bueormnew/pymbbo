@@ -57,9 +57,9 @@ class BaseModel(nn.Module):
 
         return self
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         if self.architecture is not None:
-            return self.architecture(x)
+            return self.architecture(x, **kwargs)
         
         out = x
         for layer in self.sequential_layers:

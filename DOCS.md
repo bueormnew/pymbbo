@@ -38,9 +38,15 @@ c:\Users\gerso\Pictures\Framework IA\
 │   │   ├── cnn/                       # Plugin 2: Red Convencional 2D (CNN)
 │   │   │   ├── __init__.py
 │   │   │   └── model.py
-│   │   └── transformer/               # Plugin 3: Decoder Transformer / LLM para Pruebas de Tokens
+│   │   ├── transformer/               # Plugin 3: Decoder Transformer / LLM para Pruebas de Tokens
+│   │   │   ├── __init__.py
+│   │   │   └── model.py
+│   │   └── asa_transformer/           # Plugin 4: Adaptive Selective Attention (ASA) GPT Architecture
 │   │       ├── __init__.py
-│   │       └── model.py
+│   │       ├── asa_attention.py       # Algoritmo de atención score-gated en 2 pases
+│   │       ├── asa_block.py           # ASABlock y ASALayerGroup (Selection Sharing)
+│   │       ├── triton_kernel.py       # Kernel Triton GPU y fallback PyTorch
+│   │       └── model.py               # Modelo GPT con ASA registrado en PYMBBO
 │   ├── engine/                        # Módulo 4 & 5: Bucle de Entrenamiento e Inyección de Componentes
 │   │   ├── __init__.py
 │   │   ├── trainer.py                 # fit(), evaluate(), predict(), get_metrics()
