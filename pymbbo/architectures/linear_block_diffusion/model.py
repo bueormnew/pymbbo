@@ -149,49 +149,82 @@ class LinearBlockDiffusionArchitecture(BaseArchitecture):
 
         # Standard Dataset Training Mode
         target_batch, target_len = target_ids.shape
-        
-        # Sample random timestep k per batch item
+
+        # ── Timestep sampling ─────────────────────────────────────────────
+        # k=1 → heavy masking (easy: ~87.5% tokens visible)
+        # k=K → light masking (hard: ~12.5% tokens visible)
+        # alpha_k = 1 - k/K  → fraction of tokens MASKED
         if timestep is None:
             t_k = torch.randint(1, self.num_diffusion_steps + 1, (target_batch,), device=target_ids.device)
         else:
             t_k = timestep
 
-        # Masking schedule: noise ratio alpha_k = 1 - (k / K)
-        alpha_k = 1.0 - (t_k.float() / float(self.num_diffusion_steps)) # ratio of masked tokens
+        # Masking schedule: alpha_k ∈ (0, 1−1/K]
+        # When k=K: alpha_k = 1/K (minimal masking → hardest task)
+        # When k=1: alpha_k = 1-1/K (maximal masking → easiest task)
+        alpha_k = 1.0 - (t_k.float() / float(self.num_diffusion_steps))  # (batch,)
         p_noise = noise_injection_prob if noise_injection_prob is not None else self.noise_injection_prob
 
-        # Fast Vectorized Masking on GPU
+        # ── Vectorized masking on GPU ──────────────────────────────────────
         rand_probs = torch.rand((target_batch, target_len), device=target_ids.device)
-        mask_threshold = alpha_k.unsqueeze(1)
-        mask_matrix = rand_probs < mask_threshold
+        mask_threshold = alpha_k.unsqueeze(1)            # (batch, 1)
+        mask_matrix = rand_probs < mask_threshold         # True = MASKED position
 
-        target_noisy = torch.where(mask_matrix, torch.tensor(self.mask_token_id, device=target_ids.device), target_ids)
+        # Guarantee at least 1 masked token per sample so the loss is never 0/nan
+        # (if alpha_k ≈ 0 and rand gives no masks, force-mask the first position)
+        all_visible = ~mask_matrix.any(dim=1, keepdim=True)  # (batch, 1)
+        mask_matrix = mask_matrix | all_visible
 
-        # Exposure Bias Mitigation: Inject random token corruption on a fraction of unmasked tokens
+        target_noisy = torch.where(
+            mask_matrix,
+            torch.full_like(target_ids, self.mask_token_id),
+            target_ids
+        )
+
+        # ── Exposure-bias mitigation: random token corruption ─────────────
         if p_noise > 0 and self.training:
-            corrupt_mask = (~mask_matrix) & (torch.rand((target_batch, target_len), device=target_ids.device) < p_noise)
+            corrupt_mask = (~mask_matrix) & (
+                torch.rand((target_batch, target_len), device=target_ids.device) < p_noise
+            )
             if corrupt_mask.any():
                 random_tokens = torch.randint(1, self.vocab_size - 1, (target_batch, target_len), device=target_ids.device)
                 target_noisy = torch.where(corrupt_mask, random_tokens, target_noisy)
 
-        # Embed noisy target
+        # ── Embed noisy target & refine ───────────────────────────────────
         pos = torch.arange(target_len, device=target_ids.device).unsqueeze(0)
         target_emb = self.token_embedding(target_noisy) + self.pos_embedding(pos)
-
-        # Refine target sequence
         refined_emb = self.refiner(target_emb, t_k, prompt_ctx)
-        logits = self.lm_head(refined_emb) # (batch_size, target_len, vocab_size)
+        logits = self.lm_head(refined_emb)  # (batch, target_len, vocab_size)
 
-        # Compute Cross-Entropy Loss over original target tokens
+        # ── BUG FIX #1: Loss ONLY over MASKED positions ───────────────────
+        # The model's job is to predict what was erased, NOT re-predict visible tokens.
+        # Computing loss over visible (unmasked) positions gives the model an easy
+        # shortcut (copy what's already there) and creates inconsistent gradients
+        # as the masking ratio changes → loss fluctuates and doesn't converge.
+        #
+        # mask_loss_targets: masked positions → real token id (what to predict)
+        #                    visible positions → pad_token_id (ignored in loss)
+        mask_loss_targets = torch.where(
+            mask_matrix,
+            target_ids,
+            torch.full_like(target_ids, self.pad_token_id)
+        )
+
+        # ── BUG FIX #2: Also ignore pad positions in source ───────────────
+        # Exclude positions where the original token IS the pad token.
+        pad_positions = (target_ids == self.pad_token_id)
+        mask_loss_targets = mask_loss_targets.masked_fill(pad_positions, self.pad_token_id)
+
         loss = F.cross_entropy(
             logits.view(-1, self.vocab_size),
-            target_ids.view(-1),
-            ignore_index=self.pad_token_id
+            mask_loss_targets.view(-1),
+            ignore_index=self.pad_token_id,
+            reduction='mean'
         )
 
         if return_logits:
             return logits, loss
-        
+
         # Return 1D loss tensor for fast DataParallel gathering without PCIe bandwidth bottleneck
         return loss.unsqueeze(0)
 

@@ -89,7 +89,8 @@ def test_progressive_overlapping_block_generation():
     generated = arch.generate(
         prompt_ids,
         max_new_tokens=max_new,
-        temperature=1.0
+        temperature=1.0,
+        eos_token_id=None,  # Disable EOS stopping so length is deterministic
     )
 
     # Generated sequence should have shape (batch_size, prompt_len + max_new)
@@ -97,6 +98,7 @@ def test_progressive_overlapping_block_generation():
     assert generated.shape[1] == 25 + max_new
     # Confirm prompt tokens remain at start
     assert torch.equal(generated[:, :25], prompt_ids)
+
 
 def test_dynamic_hyperparameter_overrides_in_generate():
     """Test dynamic hyperparameter overrides during inference call to generate()."""
