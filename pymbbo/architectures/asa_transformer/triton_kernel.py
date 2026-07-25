@@ -1,9 +1,22 @@
+"""
+ASA Pass-2 Triton kernel — fallback/reference backend.
+
+NOTE: In asa_attention.py, Pass-2 already dispatches to FlashAttention-2
+via F.scaled_dot_product_attention (SDPA) by reshaping to (B·H·N, 1, A).
+This module is kept as:
+  1. A reference / benchmark against SDPA.
+  2. A future entry point for custom Triton kernels that outperform SDPA
+     on sparse (variable-A) workloads.
+
+The public API (asa_pass2_attention) is preserved for compatibility.
+"""
 import math
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
-# Check Triton and CUDA availability
+# ---------------------------------------------------------------------------
+# Triton availability check
+# ---------------------------------------------------------------------------
 TRITON_AVAILABLE = False
 try:
     if torch.cuda.is_available():
@@ -14,128 +27,132 @@ except Exception:
     TRITON_AVAILABLE = False
 
 
+# ---------------------------------------------------------------------------
+# Triton kernel (reference implementation, used only when explicitly enabled)
+# ---------------------------------------------------------------------------
 if TRITON_AVAILABLE:
     @triton.jit
     def _asa_pass2_kernel(
-        Q_ptr, K_gathered_ptr, V_gathered_ptr, Out_ptr,
+        Q_ptr, K_ptr, V_ptr, Out_ptr,
         stride_qb, stride_qh, stride_qn, stride_qd,
         stride_kb, stride_kh, stride_kn, stride_ka, stride_kd,
         stride_vb, stride_vh, stride_vn, stride_va, stride_vd,
         stride_ob, stride_oh, stride_on, stride_od,
         scale,
-        B, H, N, A, D: tl.constexpr
+        B, H, N, A, D: tl.constexpr,
     ):
         """
-        Triton kernel for fused Pass-2 sparse attention over gathered K and V tokens.
-        Each thread block processes a single (batch, head, position) tuple.
+        One Triton program per (batch, head, position) triple.
+        Computes softmax-weighted sum of A gathered value vectors.
         """
         pid_b = tl.program_id(0)
         pid_h = tl.program_id(1)
         pid_n = tl.program_id(2)
 
-        # Offsets
-        d_offsets = tl.arange(0, D)
-        q_ptr = Q_ptr + pid_b * stride_qb + pid_h * stride_qh + pid_n * stride_qn + d_offsets * stride_qd
-        q_vec = tl.load(q_ptr)
+        d_off = tl.arange(0, D)
 
-        # We will compute dot products against A gathered keys, find max for numerical stability, compute exp, sum, and weighted V
-        # Load gathered keys: shape (A, D)
-        a_offsets = tl.arange(0, 1024) # Process up to 1024 tokens block size
-        mask_a = a_offsets < A
+        # Load query vector  (D,)
+        q_base = pid_b * stride_qb + pid_h * stride_qh + pid_n * stride_qn
+        q_vec  = tl.load(Q_ptr + q_base + d_off * stride_qd)
 
-        # Compute scores: score_a = sum_d (q_d * k_{a, d}) * scale
-        # We process in loops or vector registers
-        max_score = -1e9
-        
-        # Pass 1: Dot products & Max finding
-        scores = tl.zeros([1024], dtype=tl.float32) + (-1e9)
-        for a_idx in range(A):
-            k_ptr = K_gathered_ptr + pid_b * stride_kb + pid_h * stride_kh + pid_n * stride_kn + a_idx * stride_ka + d_offsets * stride_kd
-            k_vec = tl.load(k_ptr)
-            dot = tl.sum(q_vec * k_vec) * scale
-            scores = tl.where(a_offsets == a_idx, dot, scores)
+        # Compute QK scores for all A gathered keys
+        MAX_A = 1024  # kernel constraint
+        a_off    = tl.arange(0, MAX_A)
+        mask_a   = a_off < A
+        scores   = tl.full([MAX_A], -1e9, dtype=tl.float32)
 
-        # Compute Max & Exp & Sum
-        max_score = tl.max(tl.where(mask_a, scores, -1e9), axis=0)
-        exp_scores = tl.exp(scores - max_score)
-        exp_scores = tl.where(mask_a, exp_scores, 0.0)
-        sum_exp = tl.sum(exp_scores, axis=0)
-        weights = exp_scores / (sum_exp + 1e-6)
+        for a in range(A):
+            k_base = (pid_b * stride_kb + pid_h * stride_kh
+                      + pid_n * stride_kn + a * stride_ka)
+            k_vec  = tl.load(K_ptr + k_base + d_off * stride_kd)
+            dot    = tl.sum(q_vec * k_vec) * scale
+            scores = tl.where(a_off == a, dot, scores)
 
-        # Pass 2: Weighted sum over V
+        # Numerically stable softmax
+        max_s  = tl.max(tl.where(mask_a, scores, -1e9), axis=0)
+        exp_s  = tl.where(mask_a, tl.exp(scores - max_s), 0.0)
+        sum_e  = tl.sum(exp_s, axis=0)
+        w      = exp_s / (sum_e + 1e-6)
+
+        # Weighted sum of value vectors
         out_vec = tl.zeros([D], dtype=tl.float32)
-        for a_idx in range(A):
-            w = tl.sum(tl.where(a_offsets == a_idx, weights, 0.0))
-            v_ptr = V_gathered_ptr + pid_b * stride_vb + pid_h * stride_vh + pid_n * stride_vn + a_idx * stride_va + d_offsets * stride_vd
-            v_vec = tl.load(v_ptr)
-            out_vec += w * v_vec
+        for a in range(A):
+            w_a    = tl.sum(tl.where(a_off == a, w, 0.0))
+            v_base = (pid_b * stride_vb + pid_h * stride_vh
+                      + pid_n * stride_vn + a * stride_va)
+            v_vec  = tl.load(V_ptr + v_base + d_off * stride_vd)
+            out_vec += w_a * v_vec
 
-        out_ptr = Out_ptr + pid_b * stride_ob + pid_h * stride_oh + pid_n * stride_on + d_offsets * stride_od
-        tl.store(out_ptr, out_vec)
-
-
-def pytorch_gather_attention(
-    q: torch.Tensor,
-    k_gathered: torch.Tensor,
-    v_gathered: torch.Tensor,
-    scale: float
-) -> torch.Tensor:
-    """
-    High-performance PyTorch vectorized implementation of Pass 2 renormalized attention.
-
-    Args:
-        q: Query tensor of shape (batch, heads, seq_len, head_dim)
-        k_gathered: Gathered Key tensor of shape (batch, heads, seq_len, num_selected, head_dim)
-        v_gathered: Gathered Value tensor of shape (batch, heads, seq_len, num_selected, head_dim)
-        scale: Scaling factor 1.0 / sqrt(head_dim)
-
-    Returns:
-        output: Attention output tensor of shape (batch, heads, seq_len, head_dim)
-    """
-    # q: (B, H, N, D) -> (B, H, N, 1, D)
-    # k_gathered: (B, H, N, A, D)
-    # scores: (B, H, N, A)
-    scores = (q.unsqueeze(-2) * k_gathered).sum(dim=-1) * scale
-    weights = F.softmax(scores, dim=-1) # (B, H, N, A)
-    
-    # output: (B, H, N, D)
-    output = (weights.unsqueeze(-1) * v_gathered).sum(dim=-2)
-    return output
+        o_base = pid_b * stride_ob + pid_h * stride_oh + pid_n * stride_on
+        tl.store(Out_ptr + o_base + d_off * stride_od, out_vec)
 
 
+# ---------------------------------------------------------------------------
+# PyTorch vectorised fallback
+# ---------------------------------------------------------------------------
+def _pytorch_pass2(
+    q:         torch.Tensor,   # (B, H, N, D)
+    k_gathered: torch.Tensor,  # (B, H, N, A, D)
+    v_gathered: torch.Tensor,  # (B, H, N, A, D)
+    scale: float,
+) -> torch.Tensor:             # (B, H, N, D)
+    """Vectorised fallback using element-wise multiply + reduce."""
+    scores  = (q.unsqueeze(-2) * k_gathered).sum(-1) * scale  # (B,H,N,A)
+    weights = F.softmax(scores, dim=-1)
+    return (weights.unsqueeze(-1) * v_gathered).sum(-2)
+
+
+# ---------------------------------------------------------------------------
+# Public dispatcher
+# ---------------------------------------------------------------------------
 def asa_pass2_attention(
-    q: torch.Tensor,
+    q:         torch.Tensor,
     k_gathered: torch.Tensor,
     v_gathered: torch.Tensor,
-    scale: float = None
+    scale: float = None,
+    force_triton: bool = False,
 ) -> torch.Tensor:
     """
-    Pass 2 Renormalized Sparse Attention dispatcher.
-    Uses Triton GPU kernel when running on CUDA with Triton available and head_dim <= 128,
-    otherwise uses optimized PyTorch vectorized implementation.
+    Pass-2 sparse attention dispatcher.
+
+    Priority:
+      1. Triton kernel  — only when explicitly requested via force_triton=True
+                          and CUDA + Triton are available.
+      2. SDPA reshape   — FlashAttention-2 backend via F.scaled_dot_product_attention.
+                          Reshapes (B,H,N,A,D) → (B·H·N, 1, A) per-position flash.
+      3. PyTorch vector — CPU or when SDPA unavailable.
+
+    NOTE: asa_attention.py calls _pass2_attention() directly (which already
+    follows priorities 2 and 3).  This function is exposed for external use
+    or explicit Triton benchmarking.
     """
     B, H, N, D = q.shape
     A = k_gathered.shape[-2]
     if scale is None:
         scale = 1.0 / math.sqrt(D)
 
-    if (
-        TRITON_AVAILABLE 
-        and q.is_cuda 
-        and D in [16, 32, 64, 128] 
-        and A <= 1024
-    ):
-        out = torch.empty_like(q)
+    # Option 1: Triton (explicit request only)
+    if force_triton and TRITON_AVAILABLE and q.is_cuda and D in (16, 32, 64, 128) and A <= 1024:
+        out  = torch.empty_like(q)
         grid = (B, H, N)
         _asa_pass2_kernel[grid](
             q, k_gathered, v_gathered, out,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k_gathered.stride(0), k_gathered.stride(1), k_gathered.stride(2), k_gathered.stride(3), k_gathered.stride(4),
-            v_gathered.stride(0), v_gathered.stride(1), v_gathered.stride(2), v_gathered.stride(3), v_gathered.stride(4),
+            k_gathered.stride(0), k_gathered.stride(1), k_gathered.stride(2),
+            k_gathered.stride(3), k_gathered.stride(4),
+            v_gathered.stride(0), v_gathered.stride(1), v_gathered.stride(2),
+            v_gathered.stride(3), v_gathered.stride(4),
             out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-            scale,
-            B, H, N, A, D
+            scale, B, H, N, A, D,
         )
         return out
 
-    return pytorch_gather_attention(q, k_gathered, v_gathered, scale)
+    # Option 2: SDPA (FlashAttention-2) — reshape to (B·H·N, 1, A)
+    if hasattr(F, "scaled_dot_product_attention") and q.is_cuda:
+        q_s = q.reshape(B * H * N, 1, D)
+        k_s = k_gathered.reshape(B * H * N, A, D)
+        v_s = v_gathered.reshape(B * H * N, A, D)
+        return F.scaled_dot_product_attention(q_s, k_s, v_s).reshape(B, H, N, D)
+
+    # Option 3: CPU / no-SDPA vectorised fallback
+    return _pytorch_pass2(q, k_gathered, v_gathered, scale)
