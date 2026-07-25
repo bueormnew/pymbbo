@@ -120,7 +120,8 @@ def test_dynamic_hyperparameter_overrides_in_generate():
         block_size=64,
         overlap_ratio=0.25,
         num_diffusion_steps=2,
-        chunk_denoise_size=16
+        chunk_denoise_size=16,
+        eos_token_id=None
     )
 
     assert generated.shape == (1, 15 + 80)

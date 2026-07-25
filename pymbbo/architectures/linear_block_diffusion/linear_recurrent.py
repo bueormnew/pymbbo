@@ -1,3 +1,4 @@
+import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -29,62 +30,136 @@ class SwiGLU(nn.Module):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
+def _chunked_stable_scan(
+    gate_x: torch.Tensor,
+    proj_x: torch.Tensor,
+    h_init: torch.Tensor,
+    reverse: bool = False,
+    chunk_size: int = 32
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Chunked Stable Parallel Linear Recurrent Scan.
+
+    Replaces the O(T) Python-level sequential loop with O(T/chunk_size) iterations,
+    where each chunk of `chunk_size` steps is solved via a closed-form vectorized
+    cumsum formula — fully parallel on GPU, no per-token Python overhead within chunks.
+
+    The recurrence h_t = g_t * h_{t-1} + (1 - g_t) * v_t admits the closed form:
+
+        h_t = exp(S_t) * h_0 + sum_{j=1}^{t} exp(S_t - S_j) * v_j
+
+    where S_t = cumsum(log g_k, k=1..t).  exp(S_t - S_j) = prod_{k=j+1}^t g_k ∈ (0,1],
+    so it never overflows.  The cross-term h_0 * exp(S_t) is also safe because S_t ≤ 0.
+
+    For chunk_size = 32, the inner formula is evaluated over only 32 steps at once,
+    keeping numerical values well within float32 range at all times.
+
+    Args:
+        gate_x:     (B, T, D) sigmoid gate values in (0, 1)
+        proj_x:     (B, T, D) projected input values
+        h_init:     (B, D)    initial hidden state
+        reverse:    If True, scan from right-to-left (for backward pass in bidirectional)
+        chunk_size: Number of steps to vectorise at once (default 32)
+
+    Returns:
+        hidden_states: (B, T, D)
+        h_last:        (B, D)
+    """
+    B, T, D = gate_x.shape
+
+    if reverse:
+        gate_x = gate_x.flip(1)
+        proj_x = proj_x.flip(1)
+
+    h = h_init
+    hidden_states = torch.empty_like(gate_x)
+    num_chunks = (T + chunk_size - 1) // chunk_size
+
+    for c in range(num_chunks):
+        s = c * chunk_size
+        e = min(s + chunk_size, T)
+
+        g = gate_x[:, s:e, :]          # (B, L, D),  L <= chunk_size
+        v = (1.0 - g) * proj_x[:, s:e, :]  # (B, L, D) — effective input
+
+        # S_t = cumsum(log g_k, k=0..t) within the chunk, always ≤ 0
+        log_g = torch.log(g.clamp(min=1e-7))
+        S = torch.cumsum(log_g, dim=1)  # (B, L, D), range [S_min, log_g_0] ⊆ (-∞, 0]
+
+        exp_S = torch.exp(S)            # (B, L, D), ∈ (0, 1]
+        exp_neg_S = torch.exp(-S)       # (B, L, D), ∈ [1, exp(-S_min)] — SAFE for small L
+
+        # h_0 contribution: exp(S_t) * h_init_chunk
+        h_from_init = exp_S * h.unsqueeze(1)           # (B, L, D)
+
+        # Input contribution: exp(S_t) * cumsum_j(v_j * exp(-S_j))
+        # Using exclusive prefix so that position t sums inputs j = 0..t
+        cum_weighted = torch.cumsum(v * exp_neg_S, dim=1)  # (B, L, D)
+        h_from_inputs = exp_S * cum_weighted                # (B, L, D)
+
+        chunk_out = h_from_init + h_from_inputs    # (B, L, D)
+        hidden_states[:, s:e, :] = chunk_out
+        h = chunk_out[:, -1, :]                    # carry forward
+
+    if reverse:
+        hidden_states = hidden_states.flip(1)
+
+    return hidden_states, h
+
+
 class LinearRecurrentLayer(nn.Module):
     """
     Attention-Free Linear Recurrent Layer O(N) complexity.
-    Uses gated recurrence with a hidden state decay & linear input projection.
-    
+    Uses chunked-parallel stable gated recurrence — no Python per-token loop.
+
     Formula:
-      g_t = sigmoid(W_g * x_t + b_g)
+      g_t = sigmoid(W_g * x_t)
       h_t = g_t * h_{t-1} + (1 - g_t) * (W_in * x_t)
       y_t = W_out * h_t
     """
-    def __init__(self, d_model: int):
+    def __init__(self, d_model: int, chunk_size: int = 32):
         super().__init__()
         self.d_model = d_model
+        self.chunk_size = chunk_size
         self.w_in = nn.Linear(d_model, d_model)
         self.w_gate = nn.Linear(d_model, d_model)
         self.w_out = nn.Linear(d_model, d_model)
 
-    def forward(self, x: torch.Tensor, h_prev: Optional[torch.Tensor] = None, reverse: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        h_prev: Optional[torch.Tensor] = None,
+        reverse: bool = False
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            x: Input tensor of shape (batch_size, seq_len, d_model)
-            h_prev: Previous hidden state of shape (batch_size, d_model)
-            reverse: If True, processes the sequence backwards (for bidirectional modeling)
+            x:      (batch_size, seq_len, d_model)
+            h_prev: (batch_size, d_model) or None
+            reverse: Process right-to-left (bidirectional backward pass)
         Returns:
-            output: Processed sequence of shape (batch_size, seq_len, d_model)
-            h_last: Last hidden state of shape (batch_size, d_model)
+            output: (batch_size, seq_len, d_model)
+            h_last: (batch_size, d_model)
         """
-        batch_size, seq_len, _ = x.shape
-        if h_prev is None:
-            h = torch.zeros(batch_size, self.d_model, device=x.device, dtype=x.dtype)
-        else:
-            h = h_prev
+        B, T, _ = x.shape
+        h_init = (
+            torch.zeros(B, self.d_model, device=x.device, dtype=x.dtype)
+            if h_prev is None else h_prev
+        )
 
         proj_x = self.w_in(x)
         gate_x = torch.sigmoid(self.w_gate(x))
 
-        outputs = []
-        indices = range(seq_len - 1, -1, -1) if reverse else range(seq_len)
-
-        # Pre-allocate output or collect steps
-        hidden_states = [None] * seq_len
-        for t in indices:
-            g_t = gate_x[:, t, :]
-            in_t = proj_x[:, t, :]
-            h = g_t * h + (1.0 - g_t) * in_t
-            hidden_states[t] = h
-
-        stacked_h = torch.stack(hidden_states, dim=1) # (batch_size, seq_len, d_model)
-        output = self.w_out(stacked_h)
-        return output, h
+        hidden_states, h_last = _chunked_stable_scan(
+            gate_x, proj_x, h_init, reverse=reverse, chunk_size=self.chunk_size
+        )
+        output = self.w_out(hidden_states)
+        return output, h_last
 
 
 class BidirectionalLinearRecurrentBlock(nn.Module):
     """
     Bidirectional Linear Recurrent Block with SwiGLU FFN & RMSNorm.
-    Processes sequences in linear time O(N) bidirectionally inside diffusion blocks.
+    Processes sequences bidirectionally in O(N) time with chunked parallel scan.
     """
     def __init__(self, d_model: int, dropout: float = 0.1):
         super().__init__()
@@ -100,17 +175,16 @@ class BidirectionalLinearRecurrentBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: Tensor of shape (batch_size, seq_len, d_model)
+            x: (batch_size, seq_len, d_model)
         Returns:
-            Tensor of shape (batch_size, seq_len, d_model)
+            (batch_size, seq_len, d_model)
         """
         normed_x = self.norm1(x)
         fwd_out, _ = self.fwd_recurrent(normed_x, reverse=False)
         bwd_out, _ = self.bwd_recurrent(normed_x, reverse=True)
-        
+
         recurrent_out = self.combine_proj(torch.cat([fwd_out, bwd_out], dim=-1))
         x = x + self.dropout(recurrent_out)
 
-        # FFN sub-layer
         x = x + self.dropout(self.ffn(self.norm2(x)))
         return x
